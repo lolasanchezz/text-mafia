@@ -1,22 +1,11 @@
 {
   "compilerOptions": {
     "target": "esnext",
-    "lib": ["esnext"],
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "types": ["node"],
-
-    // Node runs the .ts files directly by stripping types, so there is no
-    // build output, and imports must keep their real .ts extension.
     "noEmit": true,
-    "allowImportingTsExtensions": true,
-    "verbatimModuleSyntax": true,
-    // Rejects syntax Node cannot strip (enums, namespaces, parameter properties).
-    "erasableSyntaxOnly": true,
-
     "strict": true,
     "skipLibCheck": true
-  },
-  "include": ["**/*.ts"],
-  "exclude": ["node_modules"]
+  }
 }

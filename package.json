@@ -2,10 +2,9 @@
   "name": "text-mafia",
   "version": "1.0.0",
   "description": "",
-  "main": "api/webhook.ts",
+  "main": "index.ts",
   "scripts": {
-    "typecheck": "tsc --noEmit",
-    "dev": "vercel dev"
+    "start": "node --watch index.ts"
   },
   "keywords": [],
   "author": "",
@@ -13,9 +12,12 @@
   "type": "module",
   "dependencies": {
     "@linqapp/sdk": "^0.69.2",
+    "@supabase/supabase-js": "^2.116.0",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^26.6.2",
-    "@vercel/config": "^0.7.1",
-    "@vercel/node": "^13.0.1",
     "typescript": "^7.0.2"
   }
 }
