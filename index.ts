@@ -6,7 +6,6 @@ loadEnvFile();
 const app = express();
 const PORT = Number(process.env.PORT ?? 3000);
 
-// Keep the raw body around — webhook signature checks need the exact bytes.
 app.use(
   express.json({
     verify: (req, _res, buf) => {
@@ -27,7 +26,7 @@ app.post('/webhook', (req, res) => {
 
   // Respond fast; do any slow work after the 200.
   res.sendStatus(200);
-  
+
 });
 
 app.listen(PORT, () => {
