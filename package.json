@@ -2,11 +2,10 @@
   "name": "text-mafia",
   "version": "1.0.0",
   "description": "",
-  "main": "index.ts",
+  "main": "api/webhook.ts",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "dev": "vercel dev"
   },
   "keywords": [],
   "author": "",
@@ -14,11 +13,8 @@
   "type": "module",
   "dependencies": {
     "@linqapp/sdk": "^0.69.2",
-    "express": "^5.2.1"
-  },
-  "devDependencies": {
-    "@types/express": "^5.0.6",
     "@types/node": "^26.6.2",
+    "@vercel/node": "^13.0.1",
     "typescript": "^7.0.2"
   }
 }
