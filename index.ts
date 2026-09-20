@@ -1136,11 +1136,6 @@ app.get('/', (req, res) => {
   res.send('Hello World!');
 });
 
-app.get('/table/:name', async (req, res) => {
-  const { data, error } = await supabase.from(req.params.name).select('*');
-  if (error) res.status(400).json(error);
-  else res.json(data);
-});
 
 // Skip the lobby: register the players and deal, without anyone texting.
 //   curl -X POST localhost:3000/seed-game -H 'content-type: application/json' \
