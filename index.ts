@@ -469,14 +469,10 @@ async function assignRoles(gameID: number) {
     // Sequential: these are separate Linq sends, and roles are secret, so a
     // failure part-way should not be hidden behind a batch. No gameID here —
     // this is private and per-player, never shared with the group's story.
-    const roleFlavor = await narrate(
-      `Privately tell ${label(player)} their secret role in this Mafia game: ` +
-        `${role.toUpperCase()}. Their power: "${ROLE_BLURB[role]}" Write this as a short, ` +
-        "personal, atmospheric reveal that feels specifically written for them, not a " +
-        'generic rules blurb — but keep what they can actually do each night unambiguous.',
-      ROLE_BLURB[role]!,
-    );
-    await dm(player, roleFlavor, { type: 'bubble', name: 'invisible' });
+    // The rules text is always the exact, tested ROLE_BLURB — only the one
+    // sentence in front of it is up to the model, so this can never get long
+    // or blur the actual mechanics.
+    await dm(player, ROLE_BLURB[role]!, { type: 'bubble', name: 'invisible' });
   }
 
   return shuffled.map((p, i) => ({ ...p, role: roles[i]! }));
