@@ -1216,8 +1216,10 @@ app.post('/seed-game', async (req, res) => {
   }
 });
 
-app.post('/webhook', async (req, res) => {
-  res.sendStatus(200);
+// Returns once the message has been fully handled. On Vercel the instance can
+// be frozen as soon as the response is flushed, so replying 200 first and
+// leaving the work queued meant it silently never ran.
+async function handleWebhook(req: express.Request) {
 
   const eventType = req.body.event_type;
   const event = req.body.data;
@@ -1228,7 +1230,7 @@ app.post('/webhook', async (req, res) => {
   // Vote poll events have a completely different shape (no parts) — handle
   // them before assuming this is a text message below.
   if (eventType === 'poll.vote.added' || eventType === 'poll.vote.removed') {
-    enqueue(event.chat.id, () =>
+    await enqueue(event.chat.id, () =>
       handleVote(event.message_id, event.option_id, event.sender_handle.handle, eventType === 'poll.vote.added'),
     );
     return;
@@ -1283,7 +1285,7 @@ app.post('/webhook', async (req, res) => {
     key = game?.group_chat_id ?? chatID;
   }
 
-  enqueue(key, async () => {
+  await enqueue(key, async () => {
     // A command is a command wherever it is typed. Without this, anything sent
     // in a player's own dm chat went to handleNightReply and was read as a name
     // — and with no open prompt that returns silently, so "end this game" in a
@@ -1301,6 +1303,16 @@ app.post('/webhook', async (req, res) => {
     else if (text === normalize(CANCEL_MESSAGE)) await cancelGame(chatID, handle);
     else await recordName(chatID, handle, part.value);
   });
+}
+
+app.post('/webhook', async (req, res) => {
+  try {
+    await handleWebhook(req);
+  } catch (err) {
+    console.error('webhook failed:', err);
+  }
+  // Always 200: a failure here is ours, and Linq retrying will not fix it.
+  res.sendStatus(200);
 });
 
 setInterval(() => {
