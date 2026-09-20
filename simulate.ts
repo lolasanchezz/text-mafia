@@ -2,9 +2,10 @@
 //   DRY_RUN=1 npm start
 // then in another terminal:  node simulate.ts
 import { createClient } from '@supabase/supabase-js';
+import { existsSync } from 'node:fs';
 import { loadEnvFile } from 'node:process';
 
-loadEnvFile();
+if (existsSync('.env')) loadEnvFile();
 
 const URL = 'http://localhost:3000/webhook';
 const CHAT = process.argv[2] ?? 'sim-chat-1';
