@@ -27,3 +27,8 @@ create table if not exists actions (
 
 create index if not exists actions_open_idx
   on actions (game_id, round) where answered_at is null;
+
+-- One live poll per game, so the mapping from iMessage poll options to player
+-- ids lives on the game rather than in a table of its own.
+alter table games add column if not exists poll_message_id text;
+alter table games add column if not exists poll_option_map jsonb;

@@ -21,6 +21,7 @@ const linq = new LinqAPIV3({ apiKey: process.env.LINQ_API_V3_API_KEY });
 const START_MESSAGE = 'i wanna play mafia';
 const JOIN_MESSAGE = 'i wanna play!';
 const BEGIN_MESSAGE = "let's start";
+const CANCEL_MESSAGE = 'end this game';
 
 // Two texts sent in quick succession arrive as overlapping requests, and the
 // second can read state the first has not written yet. One chain per chat keeps
@@ -51,14 +52,58 @@ const DRY_RUN = process.env.DRY_RUN === '1';
 const isChatID = (id: string) =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
 
-async function reply(chatID: string, text: string) {
-  if (DRY_RUN || !isChatID(chatID)) {
-    console.log(`  reply -> ${text}`);
+// TEST_PHONE is the whole testing story: every player's private message goes
+// to this one number instead of to them, tagged with who it was meant for. No
+// chat is ever opened for a stand-in, so Linq never 403s a made-up number.
+//
+// A game's group messages follow its chat: a real chat id means the real group
+// thread, anything else means there is no real group, so those go to
+// TEST_PHONE too, tagged [→ group].
+//
+// Reply as any of them with "Name: message" from that same thread.
+let TEST_PHONE = process.env.TEST_PHONE;
+
+// The thread we send test traffic to, opened once and reused.
+let testThreadID = process.env.TEST_CHAT_ID ?? null;
+
+async function sendToTestPhone(text: string, intendedFor: string) {
+  const tagged = `[→ ${intendedFor}] ${text}`;
+
+  if (testThreadID) {
+    await linq.chats.messages.send(testThreadID, {
+      message: { parts: [{ type: 'text', value: tagged }] },
+    });
     return;
   }
-  await linq.chats.messages.send(chatID, {
-    message: { parts: [{ type: 'text', value: text }] },
+
+  const created = await linq.chats.create({
+    from: process.env.PHONE_NUMBER!,
+    to: [TEST_PHONE!],
+    message: { parts: [{ type: 'text', value: tagged }] },
   });
+  testThreadID = created.chat.id;
+  console.log(`test thread with ${TEST_PHONE}: ${testThreadID}`);
+  console.log(`  (export TEST_CHAT_ID=${testThreadID} to reuse it across restarts)`);
+}
+
+async function reply(chatID: string, text: string, intendedFor = 'group') {
+  // DRY_RUN always wins, so the wiring can be checked without texting anyone.
+  if (DRY_RUN) {
+    console.log(`  [→ ${intendedFor}] ${text}`);
+    return;
+  }
+  // A real chat id is always used as-is: a real group chat stays real.
+  if (isChatID(chatID)) {
+    await linq.chats.messages.send(chatID, {
+      message: { parts: [{ type: 'text', value: text }] },
+    });
+    return;
+  }
+  if (TEST_PHONE) {
+    await sendToTestPhone(text, intendedFor);
+    return;
+  }
+  console.log(`  reply -> ${text}`);
 }
 
 // users.number is a bigint, so store the digits: "+1 (646) 468-4274" -> 16464684274
@@ -69,6 +114,10 @@ function toNumber(handle: string) {
 // users.number has no unique constraint, so this is select-then-insert
 // rather than an upsert.
 async function ensureUser(number: number) {
+  if (!Number.isFinite(number) || number <= 0) {
+    throw new Error(`refusing to create a player for a handle with no number (${number})`);
+  }
+
   const { data: existing, error } = await supabase
     .from('users')
     .select('id, name, current_game')
@@ -103,34 +152,58 @@ async function findGameInChat(chatID: string) {
 // no way to look one up later — so the id is kept on the user and reused.
 // A simulated game gets a fake dm id, which reply() prints instead of sending.
 async function dm(
-  user: { id: number; number: number; dm_chat_id: string | null },
+  user: { id: number; number: number; name?: string | null; dm_chat_id: string | null },
   text: string,
-  simulated: boolean,
 ) {
-  if (user.dm_chat_id) {
-    await reply(user.dm_chat_id, text);
-    return user.dm_chat_id;
+  const who = user.name ?? `+${user.number}`;
+
+  // Nobody is really messaged in test mode, so no chat is opened and Linq
+  // never sees a made-up number. The stored id is a marker, and is what routes
+  // an impersonated reply back to the right player.
+  if (TEST_PHONE) {
+    await sendToTestPhone(text, who);
+    const marker = `test:${user.number}`;
+    if (user.dm_chat_id !== marker) {
+      const { error } = await supabase
+        .from('users')
+        .update({ dm_chat_id: marker })
+        .eq('id', user.id);
+      if (error) throw error;
+    }
+    return marker;
   }
 
-  let chatID: string;
-  if (simulated) {
-    chatID = `sim-dm-${user.number}`;
-    await reply(chatID, text);
-  } else {
+  if (user.dm_chat_id && isChatID(user.dm_chat_id)) {
+    try {
+      await reply(user.dm_chat_id, text, who);
+      return user.dm_chat_id;
+    } catch (err) {
+      // A stored chat can stop existing — a deleted thread, or one opened from
+      // a different sending number. Anything but "gone" is a real failure.
+      if ((err as { status?: number })?.status !== 404) throw err;
+      console.warn(`dm chat ${user.dm_chat_id} is gone for ${user.number}; opening a new one`);
+    }
+  }
+
+  try {
     const created = await linq.chats.create({
       from: process.env.PHONE_NUMBER!,
       to: [`+${user.number}`],
       message: { parts: [{ type: 'text', value: text }] },
     });
-    chatID = created.chat.id;
+    const { error } = await supabase
+      .from('users')
+      .update({ dm_chat_id: created.chat.id })
+      .eq('id', user.id);
+    if (error) throw error;
+    return created.chat.id;
+  } catch (err) {
+    // 403 means Linq will not message them — a made-up number with no
+    // TEST_PHONE set to catch it. Carry on dealing rather than abort.
+    if ((err as { status?: number })?.status !== 403) throw err;
+    console.warn(`cannot message +${user.number} (403) — set TEST_PHONE to catch stand-in players`);
+    return null;
   }
-
-  const { error } = await supabase
-    .from('users')
-    .update({ dm_chat_id: chatID })
-    .eq('id', user.id);
-  if (error) throw error;
-  return chatID;
 }
 
 // users.current_game is the single source of truth for who is in a game;
@@ -259,7 +332,7 @@ const ROLE_BLURB: Record<string, string> = {
   villager: "you're a VILLAGER. you have no night power — just your vote and your instincts.",
 };
 
-async function assignRoles(gameID: number, simulated: boolean) {
+async function assignRoles(gameID: number) {
   const { data: players, error } = await supabase
     .from('users')
     .select('id, number, name, dm_chat_id')
@@ -279,7 +352,7 @@ async function assignRoles(gameID: number, simulated: boolean) {
 
     // Sequential: these are separate Linq sends, and roles are secret, so a
     // failure part-way should not be hidden behind a batch.
-    await dm(player, ROLE_BLURB[role]!, simulated);
+    await dm(player, ROLE_BLURB[role]!);
   }
 
   return shuffled.map((p, i) => ({ ...p, role: roles[i]! }));
@@ -310,8 +383,6 @@ async function livingPlayers(gameID: number) {
 }
 
 async function startNight(gameID: number, chatID: string) {
-  const simulated = !isChatID(chatID);
-
   const { data: game, error } = await supabase
     .from('games')
     .select('round')
@@ -327,8 +398,11 @@ async function startNight(gameID: number, chatID: string) {
   if (roundError) throw roundError;
 
   const living = await livingPlayers(gameID);
-  await reply(chatID, `night ${round}. everyone goes to sleep. still with us: ${living.map(label).join(', ')}`);
 
+  // Prompts go out before the group is told, so that by the time anyone reads
+  // "check your messages" the message is already sitting there. Announcing
+  // first left the chat silent while these were still being sent.
+  const asked: typeof living = [];
   for (const player of living) {
     const kind = NIGHT_KINDS[player.role ?? ''];
     if (!kind) continue;
@@ -344,9 +418,16 @@ async function startNight(gameID: number, chatID: string) {
     await dm(
       player,
       `${NIGHT_PROMPTS[player.role!]} reply with a name — ${choices.map(label).join(', ')}`,
-      simulated,
     );
+    asked.push(player);
   }
+
+  await reply(
+    chatID,
+    `night ${round}. everyone goes to sleep. still with us: ${living.map(label).join(', ')}. ` +
+      `${asked.length} of you have something to do tonight — check your messages from me and reply there. ` +
+      `you've got ${humanTimeout()}, then i move on without you.`,
+  );
 }
 
 // A DM from a player is an answer to whatever we last asked them.
@@ -363,10 +444,14 @@ async function handleNightReply(userID: number, raw: string, chatID: string) {
   if (!action) return;
 
   const living = await livingPlayers(action.game_id);
+  // Who this DM is with — only used to tag messages in redirect mode.
+  const self = living.find((p) => p.id === userID);
+  const who = self ? label(self) : `player ${userID}`;
+
   const guess = normalize(raw);
   const target = living.find((p) => p.name != null && normalize(p.name) === guess);
   if (!target) {
-    await reply(chatID, `i don't know who that is — try one of: ${living.map(label).join(', ')}`);
+    await reply(chatID, `i don't know who that is — try one of: ${living.map(label).join(', ')}`, who);
     return;
   }
 
@@ -378,9 +463,9 @@ async function handleNightReply(userID: number, raw: string, chatID: string) {
 
   if (action.kind === 'detective_check') {
     const verdict = target.role === 'mafia' ? 'IS mafia' : 'is not mafia';
-    await reply(chatID, `${label(target)} ${verdict}.`);
+    await reply(chatID, `${label(target)} ${verdict}.`, who);
   } else {
-    await reply(chatID, `got it — ${label(target)}.`);
+    await reply(chatID, `got it — ${label(target)}.`, who);
   }
 
   await resolveNightIfDone(action.game_id);
@@ -485,24 +570,30 @@ async function startVote(
     if (match) optionMap[option.option_id] = match.id;
   }
 
+  // One live poll per game, so it lives on the game rather than in a table of
+  // its own. A new round overwrites it, which also means a vote cast on a
+  // superseded poll no longer resolves — which is what we want.
   const { error } = await supabase
-    .from('vote_polls')
-    .insert({ message_id: pollEnvelope.message_id, game_id: gameID, option_map: optionMap });
+    .from('games')
+    .update({ poll_message_id: pollEnvelope.message_id, poll_option_map: optionMap })
+    .eq('id', gameID);
   if (error) throw error;
 }
 
 // A vote poll only ever lives in the group chat, and every option maps to a
 // player id recorded when the poll was created.
 async function handleVote(messageID: string, optionID: string, voterHandle: string, added: boolean) {
-  const { data: pollRow, error } = await supabase
-    .from('vote_polls')
-    .select('game_id, option_map')
-    .eq('message_id', messageID)
+  const { data: pollGame, error } = await supabase
+    .from('games')
+    .select('id, poll_option_map')
+    .eq('poll_message_id', messageID)
     .maybeSingle();
   if (error) throw error;
-  if (!pollRow) return;
+  // No match means a vote on a poll from an earlier round, or one for a game
+  // that has since ended. Either way there is nothing to record.
+  if (!pollGame) return;
 
-  const targetID = (pollRow.option_map as Record<string, number>)[optionID];
+  const targetID = (pollGame.poll_option_map as Record<string, number>)[optionID];
   if (targetID == null) return;
 
   const { data: voter } = await supabase
@@ -515,7 +606,7 @@ async function handleVote(messageID: string, optionID: string, voterHandle: stri
   const { data: game, error: gameError } = await supabase
     .from('games')
     .select('round, group_chat_id')
-    .eq('id', pollRow.game_id)
+    .eq('id', pollGame.id)
     .single();
   if (gameError) throw gameError;
 
@@ -525,7 +616,7 @@ async function handleVote(messageID: string, optionID: string, voterHandle: stri
     const { data: existing } = await supabase
       .from('actions')
       .select('id')
-      .eq('game_id', pollRow.game_id)
+      .eq('game_id', pollGame.id)
       .eq('round', game.round)
       .eq('kind', 'vote')
       .eq('actor', voter.id)
@@ -539,7 +630,7 @@ async function handleVote(messageID: string, optionID: string, voterHandle: stri
       if (updateError) throw updateError;
     } else {
       const { error: insertError } = await supabase.from('actions').insert({
-        game_id: pollRow.game_id,
+        game_id: pollGame.id,
         round: game.round,
         phase: 'day',
         actor: voter.id,
@@ -555,7 +646,7 @@ async function handleVote(messageID: string, optionID: string, voterHandle: stri
     const { error: deleteError } = await supabase
       .from('actions')
       .delete()
-      .eq('game_id', pollRow.game_id)
+      .eq('game_id', pollGame.id)
       .eq('round', game.round)
       .eq('kind', 'vote')
       .eq('actor', voter.id)
@@ -563,7 +654,7 @@ async function handleVote(messageID: string, optionID: string, voterHandle: stri
     if (deleteError) throw deleteError;
   }
 
-  await resolveVoteIfDone(pollRow.game_id, game.round, game.group_chat_id!);
+  await resolveVoteIfDone(pollGame.id, game.round, game.group_chat_id!);
 }
 
 // Runs once every living player has cast a vote.
@@ -624,11 +715,158 @@ async function resolveVoteIfDone(gameID: number, round: number, chatID: string) 
   await startNight(gameID, chatID);
 }
 
+// A player who never opens their messages would otherwise stall the game
+// forever, since a phase only advances when its last answer arrives.
+const NIGHT_TIMEOUT_MS = Number(process.env.NIGHT_TIMEOUT_MS ?? 120_000);
+const SWEEP_MS = Number(process.env.SWEEP_MS ?? 15_000);
+
+const humanTimeout = () => {
+  const minutes = Math.round(NIGHT_TIMEOUT_MS / 60_000);
+  if (minutes >= 1) return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+  return `${Math.max(1, Math.round(NIGHT_TIMEOUT_MS / 1000))} seconds`;
+};
+
+async function sweepStalledNights() {
+  const cutoff = new Date(Date.now() - NIGHT_TIMEOUT_MS).toISOString();
+
+  const { data: stale, error } = await supabase
+    .from('actions')
+    .select('id, game_id, actor')
+    .is('answered_at', null)
+    .lt('asked_at', cutoff);
+  if (error) throw error;
+  if (!stale?.length) return;
+
+  const byGame = new Map<number, typeof stale>();
+  for (const row of stale) {
+    byGame.set(row.game_id, [...(byGame.get(row.game_id) ?? []), row]);
+  }
+
+  for (const [gameID, rows] of byGame) {
+    const { data: game, error: gameError } = await supabase
+      .from('games')
+      .select('status, group_chat_id')
+      .eq('id', gameID)
+      .maybeSingle();
+    if (gameError) throw gameError;
+    if (!game || game.status !== 'night' || !game.group_chat_id) continue;
+
+    // Same chain as everything else touching this game, so a sweep cannot run
+    // alongside an answer that arrives at the same moment.
+    enqueue(game.group_chat_id, async () => {
+      // Answered with target still null — resolveNightIfDone already reads a
+      // missing target as "nothing happened".
+      const { error: skipError } = await supabase
+        .from('actions')
+        .update({ answered_at: new Date().toISOString() })
+        .in('id', rows.map((r) => r.id))
+        .is('answered_at', null);
+      if (skipError) throw skipError;
+
+      await reply(
+        game.group_chat_id!,
+        `time's up — ${rows.length === 1 ? 'someone' : `${rows.length} of you`} didn't answer in time, so that move is skipped.`,
+      );
+      await resolveNightIfDone(gameID);
+    });
+  }
+}
+
+// Speak as another player from your own thread: "Lola: Estella", "Lola - Estella"
+// or by id, "118: Estella". Only honoured from the redirect number, so a real
+// game can never be steered this way.
+const IMPERSONATE = /^\s*([A-Za-z0-9 _+]{1,32}?)\s*[:\-]\s*([\s\S]+)$/;
+
+async function findPlayer(nameOrID: string) {
+  const query = supabase.from('users').select('id, number, name, current_game, dm_chat_id');
+  const { data, error } = /^\d+$/.test(nameOrID)
+    ? await query.eq('id', Number(nameOrID))
+    : await query.ilike('name', nameOrID.trim());
+  if (error) throw error;
+
+  const matches = data ?? [];
+  if (matches.length <= 1) return matches[0] ?? null;
+
+  // Names repeat — a real player and a stand-in can both be "Lola". Whoever is
+  // actually in a game is the one being spoken for.
+  const inGame = matches.filter((m) => m.current_game != null);
+  if (inGame.length === 1) return inGame[0]!;
+
+  console.log(
+    `  "${nameOrID}" matches ${matches.length} players (${matches.map((m) => m.id).join(', ')}) — use an id`,
+  );
+  return null;
+}
+
+async function speakAs(target: NonNullable<Awaited<ReturnType<typeof findPlayer>>>, body: string, fallbackChat: string) {
+  const { data: game } = await supabase
+    .from('games')
+    .select('group_chat_id')
+    .eq('id', target.current_game ?? -1)
+    .maybeSingle();
+  const groupChat = game?.group_chat_id ?? fallbackChat;
+
+  // An outstanding night prompt means this is the answer to it; otherwise it is
+  // an ordinary message in the group chat.
+  const { data: open, error } = await supabase
+    .from('actions')
+    .select('id')
+    .eq('actor', target.id)
+    .is('answered_at', null)
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+
+  const t = normalize(body);
+  const isCommand = [START_MESSAGE, JOIN_MESSAGE, BEGIN_MESSAGE, CANCEL_MESSAGE].some(
+    (c) => t === normalize(c),
+  );
+
+  enqueue(groupChat, async () => {
+    // A command wins over a pending prompt, so a game can still be ended while
+    // someone is mid-answer.
+    if (open && !isCommand) {
+      await handleNightReply(target.id, body, fallbackChat);
+      return;
+    }
+    const asHandle = `+${target.number}`;
+    if (t === normalize(START_MESSAGE)) await startGame(groupChat, asHandle);
+    else if (t === normalize(JOIN_MESSAGE)) await joinGame(groupChat, asHandle);
+    else if (t === normalize(BEGIN_MESSAGE)) await beginGame(groupChat, asHandle);
+    else if (t === normalize(CANCEL_MESSAGE)) await cancelGame(groupChat, asHandle);
+    else await recordName(groupChat, asHandle, body);
+  });
+}
+
+// Call it off — works at any point, lobby or mid-round.
+async function cancelGame(chatID: string, senderHandle: string) {
+  const game = await findGameInChat(chatID);
+  if (game == null) {
+    await reply(chatID, "there's no game going in here.");
+    return;
+  }
+
+  // Look up rather than ensureUser: a passer-by should not get a record just
+  // for trying to end someone else's game.
+  const { data: user, error } = await supabase
+    .from('users')
+    .select('id')
+    .eq('number', toNumber(senderHandle))
+    .maybeSingle();
+  if (error) throw error;
+  if (!user || user.id !== game.creator) {
+    await reply(chatID, 'only whoever started the game can end it!');
+    return;
+  }
+
+  await endGame(game.id);
+  await reply(chatID, 'game called off. text "' + START_MESSAGE + '" whenever you want another one.');
+}
+
 // Placeholder for the actual mafia game — role assignment, night/day loop, etc.
 // When it reaches a win condition it should call endGame(game.id).
 async function runGame(game: { id: number; players: number[]; chatID: string }) {
-  const simulated = !isChatID(game.chatID);
-  const dealt = await assignRoles(game.id, simulated);
+  const dealt = await assignRoles(game.id);
   console.log(
     `game ${game.id}: ` + dealt.map((p) => `${p.name ?? p.number}=${p.role}`).join(', '),
   );
@@ -636,7 +874,6 @@ async function runGame(game: { id: number; players: number[]; chatID: string }) 
 }
 
 async function beginGame(chatID: string, senderHandle: string) {
-  console.log("called")
   const game = await findGameInChat(chatID);
   if (game == null) {
     await reply(chatID, `no game going yet — text "${START_MESSAGE}" to start one`);
@@ -660,15 +897,26 @@ async function beginGame(chatID: string, senderHandle: string) {
     return;
   }
 
-  const players = await playersIn(game.id);
+  await kickOff(game.id, chatID);
+}
 
-  const { error: statusError } = await supabase
+// Everything that happens once a lobby closes, with no opinion about what
+// closed it — a text command or the /seed-game endpoint.
+async function kickOff(gameID: number, chatID: string) {
+  const players = await playersIn(gameID);
+
+  const { error } = await supabase
     .from('games')
     .update({ status: 'started', players })
-    .eq('id', game.id);
-  if (statusError) throw statusError;
-  await reply(chatID, `game on — ${players.length} playing. no more joining or name changes!`);
-  await runGame({ id: game.id, players, chatID });
+    .eq('id', gameID);
+  if (error) throw error;
+
+  await reply(
+    chatID,
+    `game on — ${players.length} playing. no more joining or name changes! ` +
+      `i'm messaging each of you your role privately — go read it.`,
+  );
+  await runGame({ id: gameID, players, chatID });
 }
 
 // Any message from a player who has no name yet is taken as their name.
@@ -707,6 +955,85 @@ app.get('/table/:name', async (req, res) => {
   else res.json(data);
 });
 
+// Skip the lobby: register the players and deal, without anyone texting.
+//   curl -X POST localhost:3000/seed-game -H 'content-type: application/json' \
+//     -d '{"chat_id":"<uuid>","players":[{"number":"+1...","name":"Lola"}]}'
+app.post('/seed-game', async (req, res) => {
+  const token = process.env.ADMIN_TOKEN;
+  if (token && req.headers['x-admin-token'] !== token) {
+    res.status(401).json({ error: 'bad or missing x-admin-token' });
+    return;
+  }
+
+  const chatID: string = req.body?.chat_id ?? `sim-${Date.now()}`;
+  const players: Array<{ number: string; name?: string }> = req.body?.players ?? [];
+
+  // Send the whole game — group messages and every private dm — to one number.
+  // Lasts until the server restarts or another seed overrides it.
+  // Set from this request every time, falling back to the environment. Leaving
+  // a previous game's value in place meant one seed with redirect_to kept
+  // hijacking every later game's group messages.
+  // Resolved per request so one game's settings never leak into the next.
+  TEST_PHONE = req.body?.test_phone ? String(req.body.test_phone) : process.env.TEST_PHONE;
+
+  console.log(
+    TEST_PHONE
+      ? `all player dms for this game go to ${TEST_PHONE}` +
+          (isChatID(chatID) ? ', group messages to the real chat' : ', group messages too')
+      : 'no TEST_PHONE — every player is messaged for real',
+  );
+  if (players.length < 2) {
+    res.status(400).json({ error: 'need at least 2 players' });
+    return;
+  }
+
+  try {
+    const running = await findGameInChat(chatID);
+    if (running != null) {
+      res.status(409).json({ error: `game ${running.id} is already running in that chat` });
+      return;
+    }
+
+    const registered = [];
+    for (const p of players) {
+      const user = await ensureUser(toNumber(p.number));
+      if (p.name) {
+        const { error } = await supabase.from('users').update({ name: p.name }).eq('id', user.id);
+        if (error) throw error;
+      }
+      registered.push({ id: user.id, number: p.number, name: p.name ?? user.name });
+    }
+
+    const { data: game, error } = await supabase
+      .from('games')
+      .insert({ creator: registered[0]!.id, players: [], group_chat_id: chatID, status: 'lobby' })
+      .select('id')
+      .single();
+    if (error) throw error;
+
+    const { error: joinError } = await supabase
+      .from('users')
+      .update({ current_game: game.id })
+      .in('id', registered.map((r) => r.id));
+    if (joinError) throw joinError;
+
+    res.json({
+      game_id: game.id,
+      chat_id: chatID,
+      mode: TEST_PHONE
+        ? `dms -> ${TEST_PHONE}; group -> ${isChatID(chatID) ? 'real chat' : TEST_PHONE}`
+        : 'everything real',
+      players: registered,
+    });
+
+    // After responding: dealing sends messages and can take a few seconds.
+    enqueue(chatID, () => kickOff(game.id, chatID));
+  } catch (err) {
+    console.error('seed-game failed:', err);
+    if (!res.headersSent) res.status(500).json({ error: String(err) });
+  }
+});
+
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 
@@ -731,6 +1058,24 @@ app.post('/webhook', async (req, res) => {
   const handle = event.sender_handle.handle;
   const text = normalize(part.value);
   console.log(`inbound in ${chatID} from ${handle}: ${JSON.stringify(part.value)} -> ${JSON.stringify(text)}`);
+
+  // Only the test phone may speak as someone else, so a real game is safe.
+  if (TEST_PHONE && toNumber(handle) === toNumber(TEST_PHONE)) {
+    const match = part.value.match(IMPERSONATE);
+    if (match) {
+      try {
+        const target = await findPlayer(match[1]!);
+        if (target) {
+          console.log(`  speaking as ${target.name ?? target.number}: ${JSON.stringify(match[2])}`);
+          await speakAs(target, match[2]!, chatID);
+          return;
+        }
+        console.log(`  no player matching ${JSON.stringify(match[1])}`);
+      } catch (err) {
+        console.error('impersonation failed:', err);
+      }
+    }
+  }
 
   // Everything touching one game must share a chain: the group chat and every
   // player's DM alike. Keying off the sender instead would put someone who has
@@ -763,9 +1108,14 @@ app.post('/webhook', async (req, res) => {
     if (text === normalize(START_MESSAGE)) await startGame(chatID, handle);
     else if (text === normalize(JOIN_MESSAGE)) await joinGame(chatID, handle);
     else if (text === normalize(BEGIN_MESSAGE)) await beginGame(chatID, handle);
+    else if (text === normalize(CANCEL_MESSAGE)) await cancelGame(chatID, handle);
     else await recordName(chatID, handle, part.value);
   });
 });
+
+setInterval(() => {
+  sweepStalledNights().catch((err) => console.error('sweep failed:', err));
+}, SWEEP_MS);
 
 app.listen(port, () => {
   console.log(`Server running at http://localhost:${port}`);
