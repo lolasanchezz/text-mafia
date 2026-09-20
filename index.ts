@@ -454,6 +454,174 @@ async function startDay(gameID: number, chatID: string) {
 
   const living = await livingPlayers(gameID);
   await reply(chatID, `talk it out. ${living.length} left: ${living.map(label).join(', ')}`);
+  await startVote(gameID, chatID, living);
+}
+
+// Opens the vote out. iMessage polls are checkboxes, so a
+// voter can tick more than one name — handleVote treats whichever option they
+// picked most recently as their vote, which is the closest approximation of
+// single-choice the platform allows.
+async function startVote(
+  gameID: number,
+  chatID: string,
+  living: Array<{ id: number; name: string | null; number: number }>,
+) {
+  if (!isChatID(chatID)) {
+    console.log(`  poll -> vote off: ${living.map(label).join(', ')}`);
+    return;
+  }
+
+  await reply(chatID, 'time to vote!! tap a name in the poll to vote them out.');
+
+  const pollEnvelope = await linq.chats.polls.create(chatID, {
+    poll: { options: living.map((p) => ({ text: label(p) })) },
+  });
+
+  // Options come back in the order they were requested, but matching on text
+  // instead of position is one less assumption to rely on.
+  const optionMap: Record<string, number> = {};
+  for (const option of pollEnvelope.poll.options) {
+    const match = living.find((p) => label(p) === option.text);
+    if (match) optionMap[option.option_id] = match.id;
+  }
+
+  const { error } = await supabase
+    .from('vote_polls')
+    .insert({ message_id: pollEnvelope.message_id, game_id: gameID, option_map: optionMap });
+  if (error) throw error;
+}
+
+// A vote poll only ever lives in the group chat, and every option maps to a
+// player id recorded when the poll was created.
+async function handleVote(messageID: string, optionID: string, voterHandle: string, added: boolean) {
+  const { data: pollRow, error } = await supabase
+    .from('vote_polls')
+    .select('game_id, option_map')
+    .eq('message_id', messageID)
+    .maybeSingle();
+  if (error) throw error;
+  if (!pollRow) return;
+
+  const targetID = (pollRow.option_map as Record<string, number>)[optionID];
+  if (targetID == null) return;
+
+  const { data: voter } = await supabase
+    .from('users')
+    .select('id')
+    .eq('number', toNumber(voterHandle))
+    .maybeSingle();
+  if (!voter) return;
+
+  const { data: game, error: gameError } = await supabase
+    .from('games')
+    .select('round, group_chat_id')
+    .eq('id', pollRow.game_id)
+    .single();
+  if (gameError) throw gameError;
+
+  if (added) {
+    // At most one recorded vote per voter per round: ticking a second name
+    // overwrites the first rather than adding a second ballot.
+    const { data: existing } = await supabase
+      .from('actions')
+      .select('id')
+      .eq('game_id', pollRow.game_id)
+      .eq('round', game.round)
+      .eq('kind', 'vote')
+      .eq('actor', voter.id)
+      .maybeSingle();
+
+    if (existing) {
+      const { error: updateError } = await supabase
+        .from('actions')
+        .update({ target: targetID, answered_at: new Date().toISOString() })
+        .eq('id', existing.id);
+      if (updateError) throw updateError;
+    } else {
+      const { error: insertError } = await supabase.from('actions').insert({
+        game_id: pollRow.game_id,
+        round: game.round,
+        phase: 'day',
+        actor: voter.id,
+        kind: 'vote',
+        target: targetID,
+        answered_at: new Date().toISOString(),
+      });
+      if (insertError) throw insertError;
+    }
+  } else {
+    // Only clears the recorded vote if this was their current pick — if they
+    // had already switched to a different name, that stays recorded.
+    const { error: deleteError } = await supabase
+      .from('actions')
+      .delete()
+      .eq('game_id', pollRow.game_id)
+      .eq('round', game.round)
+      .eq('kind', 'vote')
+      .eq('actor', voter.id)
+      .eq('target', targetID);
+    if (deleteError) throw deleteError;
+  }
+
+  await resolveVoteIfDone(pollRow.game_id, game.round, game.group_chat_id!);
+}
+
+// Runs once every living player has cast a vote.
+async function resolveVoteIfDone(gameID: number, round: number, chatID: string) {
+  const living = await livingPlayers(gameID);
+
+  const { data: votes, error } = await supabase
+    .from('actions')
+    .select('target')
+    .eq('game_id', gameID)
+    .eq('round', round)
+    .eq('kind', 'vote')
+    .not('target', 'is', null);
+  if (error) throw error;
+
+  const { data: voters, error: votersError } = await supabase
+    .from('actions')
+    .select('actor')
+    .eq('game_id', gameID)
+    .eq('round', round)
+    .eq('kind', 'vote');
+  if (votersError) throw votersError;
+
+  const votedActorIds = new Set((voters ?? []).map((v) => v.actor));
+  if (!living.every((p) => votedActorIds.has(p.id))) return;
+
+  const tally = new Map<number, number>();
+  for (const v of votes ?? []) {
+    tally.set(v.target!, (tally.get(v.target!) ?? 0) + 1);
+  }
+
+  let winner: number | null = null;
+  let max = 0;
+  let tie = false;
+  for (const [target, count] of tally) {
+    if (count > max) {
+      max = count;
+      winner = target;
+      tie = false;
+    } else if (count === max) {
+      tie = true;
+    }
+  }
+
+  if (winner == null || tie) {
+    await reply(chatID, "no majority nobody's voted out this round :().");
+  } else {
+    const eliminated = living.find((p) => p.id === winner)!;
+    const { error: killError } = await supabase.from('users').update({ alive: false }).eq('id', winner);
+    if (killError) throw killError;
+    await reply(
+      chatID,
+      `${label(eliminated)} has been voted out. they were ${(eliminated.role ?? 'unknown').toUpperCase()}.`,
+    );
+  }
+
+  if (await checkWinner(gameID, chatID)) return;
+  await startNight(gameID, chatID);
 }
 
 // Placeholder for the actual mafia game — role assignment, night/day loop, etc.
@@ -542,9 +710,19 @@ app.get('/table/:name', async (req, res) => {
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 
+  const eventType = req.body.event_type;
   const event = req.body.data;
   // Without this the bot reacts to the messages it sends itself.
   if (event?.direction !== 'inbound') return;
+
+  // Vote poll events have a completely different shape (no parts) — handle
+  // them before assuming this is a text message below.
+  if (eventType === 'poll.vote.added' || eventType === 'poll.vote.removed') {
+    enqueue(event.chat.id, () =>
+      handleVote(event.message_id, event.option_id, event.sender_handle.handle, eventType === 'poll.vote.added'),
+    );
+    return;
+  }
 
   const part = event.parts?.[0];
   if (part?.type !== 'text') return;
