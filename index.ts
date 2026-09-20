@@ -22,6 +22,19 @@ const START_MESSAGE = 'i wanna play mafia';
 const JOIN_MESSAGE = 'i wanna play!';
 const BEGIN_MESSAGE = "let's start";
 
+// Two texts sent in quick succession arrive as overlapping requests, and the
+// second can read state the first has not written yet. One chain per chat keeps
+// a chat's messages in order without blocking other chats.
+const chains = new Map<string, Promise<void>>();
+
+function enqueue(chatID: string, task: () => Promise<void>) {
+  const next = (chains.get(chatID) ?? Promise.resolve())
+    .then(task)
+    .catch((err) => console.error('webhook handling failed:', err));
+  chains.set(chatID, next);
+  return next;
+}
+
 // Phones mangle typed text: iOS turns ' into ’, people add "!" or miss it,
 // capitalisation varies. Compare on letters and digits only so "let's start",
 // "Let’s start" and "lets start!" all land on the same command.
@@ -31,8 +44,19 @@ const normalize = (text: string) =>
 // The column has no default, so rows can carry a null status.
 const inLobby = (status: string | null) => status == null || status === 'lobby';
 
-function reply(chatID: string, text: string) {
-  return linq.chats.messages.send(chatID, {
+// DRY_RUN=1 prints replies instead of texting them. Simulated chats are
+// printed too: Linq rejects a chatId that is not a uuid (error 1005), so a
+// made-up chat id can only ever mean a local test.
+const DRY_RUN = process.env.DRY_RUN === '1';
+const isChatID = (id: string) =>
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+
+async function reply(chatID: string, text: string) {
+  if (DRY_RUN || !isChatID(chatID)) {
+    console.log(`  reply -> ${text}`);
+    return;
+  }
+  await linq.chats.messages.send(chatID, {
     message: { parts: [{ type: 'text', value: text }] },
   });
 }
@@ -75,23 +99,52 @@ async function findGameInChat(chatID: string) {
   return data;
 }
 
-async function addToGame(gameID: number, userID: number) {
-  const { data: game, error } = await supabase
-    .from('games')
-    .select('players')
-    .eq('id', gameID)
-    .single();
-  if (error) throw error;
-
-  const players: number[] = game.players ?? [];
-  if (!players.includes(userID)) {
-    const { error: playersError } = await supabase
-      .from('games')
-      .update({ players: [...players, userID] })
-      .eq('id', gameID);
-    if (playersError) throw playersError;
+// Linq creates a 1:1 chat and sends the first message in one call, and offers
+// no way to look one up later — so the id is kept on the user and reused.
+// A simulated game gets a fake dm id, which reply() prints instead of sending.
+async function dm(
+  user: { id: number; number: number; dm_chat_id: string | null },
+  text: string,
+  simulated: boolean,
+) {
+  if (user.dm_chat_id) {
+    await reply(user.dm_chat_id, text);
+    return user.dm_chat_id;
   }
 
+  let chatID: string;
+  if (simulated) {
+    chatID = `sim-dm-${user.number}`;
+    await reply(chatID, text);
+  } else {
+    const created = await linq.chats.create({
+      from: process.env.PHONE_NUMBER!,
+      to: [`+${user.number}`],
+      message: { parts: [{ type: 'text', value: text }] },
+    });
+    chatID = created.chat.id;
+  }
+
+  const { error } = await supabase
+    .from('users')
+    .update({ dm_chat_id: chatID })
+    .eq('id', user.id);
+  if (error) throw error;
+  return chatID;
+}
+
+// users.current_game is the single source of truth for who is in a game;
+// games.players is written once, at kickoff, from this.
+async function playersIn(gameID: number) {
+  const { data, error } = await supabase
+    .from('users')
+    .select('id')
+    .eq('current_game', gameID);
+  if (error) throw error;
+  return (data ?? []).map((u) => u.id);
+}
+
+async function addToGame(gameID: number, userID: number) {
   const { error: joinError } = await supabase
     .from('users')
     .update({ current_game: gameID })
@@ -160,12 +213,7 @@ async function joinGame(chatID: string, senderHandle: string) {
 // Marks the game over and frees its players to start or join another one.
 // Call this when the game logic reaches a win condition.
 async function endGame(gameID: number) {
-  const { data: game, error } = await supabase
-    .from('games')
-    .select('players')
-    .eq('id', gameID)
-    .single();
-  if (error) throw error;
+  const players = await playersIn(gameID);
 
   const { error: statusError } = await supabase
     .from('games')
@@ -176,14 +224,247 @@ async function endGame(gameID: number) {
   const { error: freeError } = await supabase
     .from('users')
     .update({ current_game: null })
-    .in('id', game.players ?? []);
+    .in('id', players);
   if (freeError) throw freeError;
+}
+
+// Roughly one mafia per four players, then a doctor and a detective once the
+// village is big enough to survive them.
+function roleSpread(playerCount: number) {
+  const mafia = Math.max(1, Math.floor(playerCount / 4));
+  const doctor = playerCount >= 4 ? 1 : 0;
+  const detective = playerCount >= 5 ? 1 : 0;
+  const roles = [
+    ...Array<string>(mafia).fill('mafia'),
+    ...Array<string>(doctor).fill('doctor'),
+    ...Array<string>(detective).fill('detective'),
+  ];
+  while (roles.length < playerCount) roles.push('villager');
+  return roles.slice(0, playerCount);
+}
+
+function shuffle<T>(items: T[]) {
+  const out = [...items];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j]!, out[i]!];
+  }
+  return out;
+}
+
+const ROLE_BLURB: Record<string, string> = {
+  mafia: "you're MAFIA. every night you pick someone to take out. don't get caught.",
+  doctor: "you're the DOCTOR. every night you pick one person to save.",
+  detective: "you're the DETECTIVE. every night you can investigate one person.",
+  villager: "you're a VILLAGER. you have no night power — just your vote and your instincts.",
+};
+
+async function assignRoles(gameID: number, simulated: boolean) {
+  const { data: players, error } = await supabase
+    .from('users')
+    .select('id, number, name, dm_chat_id')
+    .eq('current_game', gameID);
+  if (error) throw error;
+
+  const shuffled = shuffle(players ?? []);
+  const roles = roleSpread(shuffled.length);
+
+  for (const [i, player] of shuffled.entries()) {
+    const role = roles[i]!;
+    const { error: roleError } = await supabase
+      .from('users')
+      .update({ role, alive: true })
+      .eq('id', player.id);
+    if (roleError) throw roleError;
+
+    // Sequential: these are separate Linq sends, and roles are secret, so a
+    // failure part-way should not be hidden behind a batch.
+    await dm(player, ROLE_BLURB[role]!, simulated);
+  }
+
+  return shuffled.map((p, i) => ({ ...p, role: roles[i]! }));
+}
+
+const NIGHT_KINDS: Record<string, string> = {
+  mafia: 'mafia_kill',
+  doctor: 'doctor_save',
+  detective: 'detective_check',
+};
+
+const NIGHT_PROMPTS: Record<string, string> = {
+  mafia: 'who do you want to take out tonight?',
+  doctor: 'who do you want to save tonight?',
+  detective: 'who do you want to investigate tonight?',
+};
+
+const label = (p: { name: string | null; number: number }) => p.name ?? `+${p.number}`;
+
+async function livingPlayers(gameID: number) {
+  const { data, error } = await supabase
+    .from('users')
+    .select('id, number, name, role, alive, dm_chat_id')
+    .eq('current_game', gameID)
+    .eq('alive', true);
+  if (error) throw error;
+  return data ?? [];
+}
+
+async function startNight(gameID: number, chatID: string) {
+  const simulated = !isChatID(chatID);
+
+  const { data: game, error } = await supabase
+    .from('games')
+    .select('round')
+    .eq('id', gameID)
+    .single();
+  if (error) throw error;
+
+  const round = (game.round ?? 0) + 1;
+  const { error: roundError } = await supabase
+    .from('games')
+    .update({ round, status: 'night' })
+    .eq('id', gameID);
+  if (roundError) throw roundError;
+
+  const living = await livingPlayers(gameID);
+  await reply(chatID, `night ${round}. everyone goes to sleep. still with us: ${living.map(label).join(', ')}`);
+
+  for (const player of living) {
+    const kind = NIGHT_KINDS[player.role ?? ''];
+    if (!kind) continue;
+
+    // Written with target null: the answer arrives later on its own webhook.
+    const { error: askError } = await supabase
+      .from('actions')
+      .insert({ game_id: gameID, round, phase: 'night', actor: player.id, kind });
+    if (askError) throw askError;
+
+    // Mafia cannot pick themselves; the doctor is allowed to self-save.
+    const choices = living.filter((o) => !(player.role === 'mafia' && o.id === player.id));
+    await dm(
+      player,
+      `${NIGHT_PROMPTS[player.role!]} reply with a name — ${choices.map(label).join(', ')}`,
+      simulated,
+    );
+  }
+}
+
+// A DM from a player is an answer to whatever we last asked them.
+async function handleNightReply(userID: number, raw: string, chatID: string) {
+  const { data: action, error } = await supabase
+    .from('actions')
+    .select('id, game_id, round, kind')
+    .eq('actor', userID)
+    .is('answered_at', null)
+    .order('asked_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  if (!action) return;
+
+  const living = await livingPlayers(action.game_id);
+  const guess = normalize(raw);
+  const target = living.find((p) => p.name != null && normalize(p.name) === guess);
+  if (!target) {
+    await reply(chatID, `i don't know who that is — try one of: ${living.map(label).join(', ')}`);
+    return;
+  }
+
+  const { error: answerError } = await supabase
+    .from('actions')
+    .update({ target: target.id, answered_at: new Date().toISOString() })
+    .eq('id', action.id);
+  if (answerError) throw answerError;
+
+  if (action.kind === 'detective_check') {
+    const verdict = target.role === 'mafia' ? 'IS mafia' : 'is not mafia';
+    await reply(chatID, `${label(target)} ${verdict}.`);
+  } else {
+    await reply(chatID, `got it — ${label(target)}.`);
+  }
+
+  await resolveNightIfDone(action.game_id);
+}
+
+// Runs once the last outstanding night action comes in.
+async function resolveNightIfDone(gameID: number) {
+  const { data: game, error } = await supabase
+    .from('games')
+    .select('id, round, group_chat_id')
+    .eq('id', gameID)
+    .single();
+  if (error) throw error;
+
+  const { data: actions, error: actionsError } = await supabase
+    .from('actions')
+    .select('kind, target, answered_at')
+    .eq('game_id', gameID)
+    .eq('round', game.round);
+  if (actionsError) throw actionsError;
+  if ((actions ?? []).some((a) => a.answered_at == null)) return;
+
+  const chatID = game.group_chat_id!;
+  const killed = actions!.find((a) => a.kind === 'mafia_kill')?.target ?? null;
+  const saved = actions!.find((a) => a.kind === 'doctor_save')?.target ?? null;
+
+  let died: { id: number; name: string | null; number: number } | null = null;
+  if (killed != null && killed !== saved) {
+    const living = await livingPlayers(gameID);
+    died = living.find((p) => p.id === killed) ?? null;
+    const { error: killError } = await supabase
+      .from('users')
+      .update({ alive: false })
+      .eq('id', killed);
+    if (killError) throw killError;
+  }
+
+  await reply(
+    chatID,
+    died
+      ? `morning. ${label(died)} didn't make it through the night.`
+      : 'morning. somehow, everyone made it through the night.',
+  );
+
+  if (await checkWinner(gameID, chatID)) return;
+  await startDay(gameID, chatID);
+}
+
+// Returns true when the game is over, so the caller knows not to start a phase.
+async function checkWinner(gameID: number, chatID: string) {
+  const living = await livingPlayers(gameID);
+  const mafia = living.filter((p) => p.role === 'mafia');
+  const rest = living.filter((p) => p.role !== 'mafia');
+
+  if (mafia.length === 0) {
+    await reply(chatID, 'the village wins — every mafia is gone!');
+    await endGame(gameID);
+    return true;
+  }
+  if (mafia.length >= rest.length) {
+    await reply(chatID, `the mafia win. it was ${mafia.map(label).join(' and ')}.`);
+    await endGame(gameID);
+    return true;
+  }
+  return false;
+}
+
+async function startDay(gameID: number, chatID: string) {
+  const { error } = await supabase.from('games').update({ status: 'day' }).eq('id', gameID);
+  if (error) throw error;
+
+  const living = await livingPlayers(gameID);
+  await reply(chatID, `talk it out. ${living.length} left: ${living.map(label).join(', ')}`);
 }
 
 // Placeholder for the actual mafia game — role assignment, night/day loop, etc.
 // When it reaches a win condition it should call endGame(game.id).
-async function runGame(game: { id: number; players: number[] }) {
-  console.log(`game ${game.id} started with ${game.players.length} players`);
+async function runGame(game: { id: number; players: number[]; chatID: string }) {
+  const simulated = !isChatID(game.chatID);
+  const dealt = await assignRoles(game.id, simulated);
+  console.log(
+    `game ${game.id}: ` + dealt.map((p) => `${p.name ?? p.number}=${p.role}`).join(', '),
+  );
+  await startNight(game.id, game.chatID);
 }
 
 async function beginGame(chatID: string, senderHandle: string) {
@@ -211,15 +492,15 @@ async function beginGame(chatID: string, senderHandle: string) {
     return;
   }
 
+  const players = await playersIn(game.id);
+
   const { error: statusError } = await supabase
     .from('games')
-    .update({ status: 'started' })
+    .update({ status: 'started', players })
     .eq('id', game.id);
   if (statusError) throw statusError;
-
-  const players: number[] = game.players ?? [];
   await reply(chatID, `game on — ${players.length} playing. no more joining or name changes!`);
-  await runGame({ id: game.id, players });
+  await runGame({ id: game.id, players, chatID });
 }
 
 // Any message from a player who has no name yet is taken as their name.
@@ -271,16 +552,41 @@ app.post('/webhook', async (req, res) => {
   const chatID = event.chat.id;
   const handle = event.sender_handle.handle;
   const text = normalize(part.value);
-  console.log(`inbound from ${handle}: ${JSON.stringify(part.value)} -> ${JSON.stringify(text)}`);
+  console.log(`inbound in ${chatID} from ${handle}: ${JSON.stringify(part.value)} -> ${JSON.stringify(text)}`);
 
-  try {
+  // Everything touching one game must share a chain: the group chat and every
+  // player's DM alike. Keying off the sender instead would put someone who has
+  // not joined yet on a different chain from the chat they are joining.
+  const { data: sender } = await supabase
+    .from('users')
+    .select('id, current_game, dm_chat_id')
+    .eq('number', toNumber(handle))
+    .maybeSingle();
+
+  // The key must not change as a game comes and goes, or messages sent either
+  // side of its creation land on different chains and race. A game belongs to
+  // exactly one group chat, so that id is stable for the whole game: group
+  // messages key on themselves, and a DM keys on its game's group chat.
+  let key = chatID;
+  if (sender && sender.dm_chat_id === chatID && sender.current_game != null) {
+    const { data: game } = await supabase
+      .from('games')
+      .select('group_chat_id')
+      .eq('id', sender.current_game)
+      .maybeSingle();
+    key = game?.group_chat_id ?? chatID;
+  }
+
+  enqueue(key, async () => {
+    if (sender && sender.dm_chat_id === chatID) {
+      await handleNightReply(sender.id, part.value, chatID);
+      return;
+    }
     if (text === normalize(START_MESSAGE)) await startGame(chatID, handle);
     else if (text === normalize(JOIN_MESSAGE)) await joinGame(chatID, handle);
     else if (text === normalize(BEGIN_MESSAGE)) await beginGame(chatID, handle);
     else await recordName(chatID, handle, part.value);
-  } catch (err) {
-    console.error('webhook handling failed:', err);
-  }
+  });
 });
 
 app.listen(port, () => {
