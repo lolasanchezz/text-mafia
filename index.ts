@@ -2,9 +2,13 @@ import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import LinqAPIV3 from '@linqapp/sdk';
 import Anthropic from '@anthropic-ai/sdk';
+import { existsSync } from 'node:fs';
 import { loadEnvFile } from 'node:process';
 
-loadEnvFile();
+// Locally the config lives in .env; on a host like Vercel it is already in the
+// process environment and there is no file. loadEnvFile() throws ENOENT when
+// the file is missing, which would take the whole app down on boot.
+if (existsSync('.env')) loadEnvFile();
 
 const app = express();
 const port = 3000;

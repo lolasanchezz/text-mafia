@@ -1,9 +1,10 @@
 // One-off script: creates (or finds) a group chat with whoever you list.
 // Usage: node linq_library.ts +16177779754 +19788818678 [+more...]
 import LinqAPIV3 from '@linqapp/sdk';
+import { existsSync } from 'node:fs';
 import { loadEnvFile } from 'node:process';
 
-loadEnvFile();
+if (existsSync('.env')) loadEnvFile();
 
 const client = new LinqAPIV3({
   apiKey: process.env.LINQ_API_V3_API_KEY,
