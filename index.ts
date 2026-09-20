@@ -1,6 +1,7 @@
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import LinqAPIV3 from '@linqapp/sdk';
+import Anthropic from '@anthropic-ai/sdk';
 import { loadEnvFile } from 'node:process';
 
 loadEnvFile();
@@ -17,6 +18,115 @@ const supabase = createClient(
 );
 
 const linq = new LinqAPIV3({ apiKey: process.env.LINQ_API_V3_API_KEY });
+
+// Narration and reply-parsing are both best-effort: no key, a timeout, or an
+// API error should never stall the game — every call site falls back to a
+// plain deterministic string.
+const anthropic = process.env.ANTHROPIC_API_KEY
+  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+  : null;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([p, timeout]);
+  } finally {
+    clearTimeout(timer!);
+  }
+}
+
+const NARRATOR_SYSTEM =
+  'You are the narrator for a text-message game of Mafia. Write one or two ' +
+  'short, punchy sentences of flavor for the moment described. No emoji, no ' +
+  'markdown, plain text only — this is sent as a real text message. Keep it ' +
+  'tasteful and non-graphic: no ropes, hangings, knives. A player being ' +
+  'removed from the game is BANISHED or EXILED from the village, never ' +
+  'killed — describe it that way even when the prompt says "eliminated" or ' +
+  '"killed". Be specific and unusual rather than generic: give each moment a ' +
+  'concrete, small, memorable detail (something they were carrying, a habit, ' +
+  'a rumor about them) instead of a stock phrase — no two deaths or reveals ' +
+  'should read alike. If earlier messages in this conversation described this ' +
+  'game, this is the same ongoing story: keep the tone and world consistent, ' +
+  'and callback to a specific earlier detail or character when it fits ' +
+  'naturally, rather than restarting the scene from nothing each time.';
+
+type NarrationTurn = { role: 'user' | 'assistant'; content: string };
+
+// Flavor text for a moment in the game. Never used for anything a player
+// needs to act on precisely — those stay plain text. Pass gameID to thread
+// this into the game's ongoing public story (dawn/vote/win beats only — never
+// pass gameID for anything containing secret info, like a role or a night
+// target, since that history is reused for later PUBLIC group messages).
+async function narrate(prompt: string, fallback: string, gameID?: number): Promise<string> {
+  if (!anthropic) return fallback;
+  try {
+    let history: NarrationTurn[] = [];
+    if (gameID != null) {
+      const { data } = await supabase.from('games').select('narration').eq('id', gameID).maybeSingle();
+      history = (data?.narration as NarrationTurn[] | null) ?? [];
+    }
+
+    const messages: NarrationTurn[] = [...history, { role: 'user', content: prompt }];
+    const message = await withTimeout(
+      anthropic.messages.create({
+        model: 'claude-opus-5',
+        max_tokens: 1024,
+        output_config: { effort: 'low' }, // short, latency-sensitive — depth isn't needed here
+        system: NARRATOR_SYSTEM,
+        messages,
+      }),
+      8000,
+    );
+    const text = message.content.find((b) => b.type === 'text')?.text?.trim();
+    if (!text) return fallback;
+
+    if (gameID != null) {
+      // Capped so the transcript sent on every call stays small and cheap —
+      // recent beats matter far more than the opening of a long game.
+      const updated = [...messages, { role: 'assistant', content: text }].slice(-40);
+      await supabase.from('games').update({ narration: updated }).eq('id', gameID);
+    }
+
+    return text;
+  } catch (err) {
+    console.warn('narrate() failed, using fallback:', err);
+    return fallback;
+  }
+}
+
+// Turns a casual reply ("kill sam i guess", "who's still alive?") into one of
+// the valid choices, or null if it isn't a clear pick — a question, a joke, or
+// genuinely unclear. Exact matches never reach this; it's only the fallback.
+async function interpretReply(raw: string, choices: string[]): Promise<string | null> {
+  if (!anthropic) return null;
+  try {
+    const message = await withTimeout(
+      anthropic.messages.create({
+        model: 'claude-haiku-4-5',
+        max_tokens: 20,
+        system:
+          'A player in a Mafia game was asked to name one of these people: ' +
+          `${choices.join(', ')}. Reply with exactly one name from that list if their ` +
+          'message clearly picks someone, matching case exactly as given. If their ' +
+          "message is a question, a joke, or doesn't clearly pick anyone from the list, " +
+          'reply with exactly: NONE. No other text.',
+        messages: [{ role: 'user', content: raw }],
+      }),
+      4000,
+    );
+    const text = message.content.find((b) => b.type === 'text')?.text?.trim();
+    if (!text || text === 'NONE') return null;
+    return choices.find((c) => c === text) ?? null;
+  } catch (err) {
+    console.warn('interpretReply() failed:', err);
+    return null;
+  }
+}
 
 const START_MESSAGE = 'i wanna play mafia';
 const JOIN_MESSAGE = 'i wanna play!';
@@ -86,7 +196,12 @@ async function sendToTestPhone(text: string, intendedFor: string) {
   console.log(`  (export TEST_CHAT_ID=${testThreadID} to reuse it across restarts)`);
 }
 
-async function reply(chatID: string, text: string, intendedFor = 'group') {
+async function reply(
+  chatID: string,
+  text: string,
+  intendedFor = 'group',
+  effect?: { type: 'screen' | 'bubble'; name: string },
+) {
   // DRY_RUN always wins, so the wiring can be checked without texting anyone.
   if (DRY_RUN) {
     console.log(`  [→ ${intendedFor}] ${text}`);
@@ -95,7 +210,7 @@ async function reply(chatID: string, text: string, intendedFor = 'group') {
   // A real chat id is always used as-is: a real group chat stays real.
   if (isChatID(chatID)) {
     await linq.chats.messages.send(chatID, {
-      message: { parts: [{ type: 'text', value: text }] },
+      message: { parts: [{ type: 'text', value: text }], effect },
     });
     return;
   }
@@ -154,6 +269,7 @@ async function findGameInChat(chatID: string) {
 async function dm(
   user: { id: number; number: number; name?: string | null; dm_chat_id: string | null },
   text: string,
+  effect?: { type: 'screen' | 'bubble'; name: string },
 ) {
   const who = user.name ?? `+${user.number}`;
 
@@ -175,7 +291,7 @@ async function dm(
 
   if (user.dm_chat_id && isChatID(user.dm_chat_id)) {
     try {
-      await reply(user.dm_chat_id, text, who);
+      await reply(user.dm_chat_id, text, who, effect);
       return user.dm_chat_id;
     } catch (err) {
       // A stored chat can stop existing — a deleted thread, or one opened from
@@ -189,7 +305,7 @@ async function dm(
     const created = await linq.chats.create({
       from: process.env.PHONE_NUMBER!,
       to: [`+${user.number}`],
-      message: { parts: [{ type: 'text', value: text }] },
+      message: { parts: [{ type: 'text', value: text }], effect },
     });
     const { error } = await supabase
       .from('users')
@@ -351,8 +467,16 @@ async function assignRoles(gameID: number) {
     if (roleError) throw roleError;
 
     // Sequential: these are separate Linq sends, and roles are secret, so a
-    // failure part-way should not be hidden behind a batch.
-    await dm(player, ROLE_BLURB[role]!);
+    // failure part-way should not be hidden behind a batch. No gameID here —
+    // this is private and per-player, never shared with the group's story.
+    const roleFlavor = await narrate(
+      `Privately tell ${label(player)} their secret role in this Mafia game: ` +
+        `${role.toUpperCase()}. Their power: "${ROLE_BLURB[role]}" Write this as a short, ` +
+        "personal, atmospheric reveal that feels specifically written for them, not a " +
+        'generic rules blurb — but keep what they can actually do each night unambiguous.',
+      ROLE_BLURB[role]!,
+    );
+    await dm(player, roleFlavor, { type: 'bubble', name: 'invisible' });
   }
 
   return shuffled.map((p, i) => ({ ...p, role: roles[i]! }));
@@ -448,8 +572,17 @@ async function handleNightReply(userID: number, raw: string, chatID: string) {
   const self = living.find((p) => p.id === userID);
   const who = self ? label(self) : `player ${userID}`;
 
+  const named = living.filter((p): p is typeof p & { name: string } => p.name != null);
   const guess = normalize(raw);
-  const target = living.find((p) => p.name != null && normalize(p.name) === guess);
+  let target = named.find((p) => normalize(p.name) === guess);
+
+  // Not an exact match — let Claude take a shot at casual phrasing ("kill sam
+  // i guess") before giving up. A question or joke correctly resolves to null.
+  if (!target) {
+    const picked = await interpretReply(raw, named.map((p) => p.name));
+    target = picked ? named.find((p) => p.name === picked) : undefined;
+  }
+
   if (!target) {
     await reply(chatID, `i don't know who that is — try one of: ${living.map(label).join(', ')}`, who);
     return;
@@ -462,10 +595,27 @@ async function handleNightReply(userID: number, raw: string, chatID: string) {
   if (answerError) throw answerError;
 
   if (action.kind === 'detective_check') {
+    // The verdict itself is never left to the model's phrasing — too high-stakes
+    // to risk ambiguity — but a narrated line can still frame it atmospherically.
     const verdict = target.role === 'mafia' ? 'IS mafia' : 'is not mafia';
-    await reply(chatID, `${label(target)} ${verdict}.`, who);
+    const flavor = await narrate(
+      `Privately tell the detective one atmospheric sentence about investigating ` +
+        `${label(target)} tonight — what they noticed, a detail, a feeling. Do not ` +
+        'state the verdict itself, that gets appended after your line separately.',
+      '',
+    );
+    await reply(chatID, `${flavor ? flavor + ' ' : ''}${label(target)} ${verdict}.`, who);
   } else {
-    await reply(chatID, `got it — ${label(target)}.`, who);
+    await reply(
+      chatID,
+      await narrate(
+        `Privately confirm to a player in a Mafia game that their night action ` +
+          `targeted ${label(target)}. Keep it short and in-character for a secret ` +
+          'message — do not reveal what kind of action it was.',
+        `got it — ${label(target)}.`,
+      ),
+      who,
+    );
   }
 
   await resolveNightIfDone(action.game_id);
@@ -503,12 +653,13 @@ async function resolveNightIfDone(gameID: number) {
     if (killError) throw killError;
   }
 
-  await reply(
-    chatID,
-    died
-      ? `morning. ${label(died)} didn't make it through the night.`
-      : 'morning. somehow, everyone made it through the night.',
-  );
+  const fallback = died
+    ? `morning. ${label(died)} didn't make it through the night.`
+    : 'morning. somehow, everyone made it through the night.';
+  const text = died
+    ? await narrate(`It's dawn. ${label(died)} was killed during the night. Announce their death.`, fallback, gameID)
+    : await narrate('It\'s dawn and nobody died last night — the doctor saved the target. Announce that.', fallback, gameID);
+  await reply(chatID, text);
 
   if (await checkWinner(gameID, chatID)) return;
   await startDay(gameID, chatID);
@@ -521,12 +672,18 @@ async function checkWinner(gameID: number, chatID: string) {
   const rest = living.filter((p) => p.role !== 'mafia');
 
   if (mafia.length === 0) {
-    await reply(chatID, 'the village wins — every mafia is gone!');
+    const fallback = 'the village wins — every mafia is gone!';
+    await reply(chatID, await narrate('The village found and eliminated every mafia member. The village has won. Announce the victory — this is the ending of the story you\'ve been telling all game.', fallback, gameID));
     await endGame(gameID);
     return true;
   }
   if (mafia.length >= rest.length) {
-    await reply(chatID, `the mafia win. it was ${mafia.map(label).join(' and ')}.`);
+    const names = mafia.map(label).join(' and ');
+    const fallback = `the mafia win. it was ${names}.`;
+    await reply(
+      chatID,
+      await narrate(`The mafia now equal or outnumber the village. The mafia have won the game. The mafia were: ${names}. Announce their victory and reveal who they were — this is the ending of the story you've been telling all game.`, fallback, gameID),
+    );
     await endGame(gameID);
     return true;
   }
@@ -556,7 +713,10 @@ async function startVote(
     return;
   }
 
-  await reply(chatID, 'time to vote!! tap a name in the poll to vote them out.');
+  await reply(
+    chatID,
+    `time to vote!! tap a name in the poll to vote them out. you've got ${humanTimeout()}, then anyone who hasn't voted is skipped.`,
+  );
 
   const pollEnvelope = await linq.chats.polls.create(chatID, {
     poll: { options: living.map((p) => ({ text: label(p) })) },
@@ -573,11 +733,21 @@ async function startVote(
   // One live poll per game, so it lives on the game rather than in a table of
   // its own. A new round overwrites it, which also means a vote cast on a
   // superseded poll no longer resolves — which is what we want.
-  const { error } = await supabase
+  const { data: game, error } = await supabase
     .from('games')
     .update({ poll_message_id: pollEnvelope.message_id, poll_option_map: optionMap })
-    .eq('id', gameID);
+    .eq('id', gameID)
+    .select('round')
+    .single();
   if (error) throw error;
+
+  // Placeholder rows, target null — same shape as a night action's ask. Without
+  // these, a player who never votes leaves nothing for the sweep to find, and
+  // resolveVoteIfDone waits on them forever.
+  const { error: placeholderError } = await supabase.from('actions').insert(
+    living.map((p) => ({ game_id: gameID, round: game.round, phase: 'day', actor: p.id, kind: 'vote' })),
+  );
+  if (placeholderError) throw placeholderError;
 }
 
 // A vote poll only ever lives in the group chat, and every option maps to a
@@ -661,24 +831,18 @@ async function handleVote(messageID: string, optionID: string, voterHandle: stri
 async function resolveVoteIfDone(gameID: number, round: number, chatID: string) {
   const living = await livingPlayers(gameID);
 
+  // Placeholder rows exist for every living player from the moment the poll
+  // opens, so "has everyone voted" must check answered_at, not just existence.
   const { data: votes, error } = await supabase
     .from('actions')
-    .select('target')
+    .select('actor, target')
     .eq('game_id', gameID)
     .eq('round', round)
     .eq('kind', 'vote')
-    .not('target', 'is', null);
+    .not('answered_at', 'is', null);
   if (error) throw error;
 
-  const { data: voters, error: votersError } = await supabase
-    .from('actions')
-    .select('actor')
-    .eq('game_id', gameID)
-    .eq('round', round)
-    .eq('kind', 'vote');
-  if (votersError) throw votersError;
-
-  const votedActorIds = new Set((voters ?? []).map((v) => v.actor));
+  const votedActorIds = new Set((votes ?? []).map((v) => v.actor));
   if (!living.every((p) => votedActorIds.has(p.id))) return;
 
   const tally = new Map<number, number>();
@@ -700,14 +864,33 @@ async function resolveVoteIfDone(gameID: number, round: number, chatID: string) 
   }
 
   if (winner == null || tie) {
-    await reply(chatID, "no majority nobody's voted out this round :().");
+    await reply(chatID, await narrate('The village vote ended in a tie, so nobody was voted out this round. Announce that.', "no majority nobody's voted out this round :().", gameID));
   } else {
     const eliminated = living.find((p) => p.id === winner)!;
     const { error: killError } = await supabase.from('users').update({ alive: false }).eq('id', winner);
     if (killError) throw killError;
+    const role = (eliminated.role ?? 'unknown').toUpperCase();
+
     await reply(
       chatID,
-      `${label(eliminated)} has been voted out. they were ${(eliminated.role ?? 'unknown').toUpperCase()}.`,
+      await narrate(
+        `The village just voted to eliminate ${label(eliminated)}. Announce that they've been voted out — do not reveal their role yet, that comes next.`,
+        `${label(eliminated)} has been voted out.`,
+        gameID,
+      ),
+    );
+
+    await sleep(2000);
+
+    await reply(
+      chatID,
+      await narrate(
+        `${label(eliminated)} was just voted out and their role is about to be revealed: they were ${role}. Write one short, dramatic line revealing this.`,
+        `${label(eliminated)} was ${role}.`,
+        gameID,
+      ),
+      'group',
+      { type: 'screen', name: 'spotlight' },
     );
   }
 
@@ -745,17 +928,18 @@ async function sweepStalledNights() {
   for (const [gameID, rows] of byGame) {
     const { data: game, error: gameError } = await supabase
       .from('games')
-      .select('status, group_chat_id')
+      .select('status, round, group_chat_id')
       .eq('id', gameID)
       .maybeSingle();
     if (gameError) throw gameError;
-    if (!game || game.status !== 'night' || !game.group_chat_id) continue;
+    if (!game || !game.group_chat_id) continue;
+    if (game.status !== 'night' && game.status !== 'day') continue;
 
     // Same chain as everything else touching this game, so a sweep cannot run
     // alongside an answer that arrives at the same moment.
     enqueue(game.group_chat_id, async () => {
-      // Answered with target still null — resolveNightIfDone already reads a
-      // missing target as "nothing happened".
+      // Answered with target still null — both resolvers already read a
+      // missing target as "nothing happened" / "didn't vote".
       const { error: skipError } = await supabase
         .from('actions')
         .update({ answered_at: new Date().toISOString() })
@@ -765,9 +949,10 @@ async function sweepStalledNights() {
 
       await reply(
         game.group_chat_id!,
-        `time's up — ${rows.length === 1 ? 'someone' : `${rows.length} of you`} didn't answer in time, so that move is skipped.`,
+        `time's up — ${rows.length === 1 ? 'someone' : `${rows.length} of you`} didn't answer in time, so that ${game.status === 'night' ? 'move is' : 'vote doesn\'t count and is'} skipped.`,
       );
-      await resolveNightIfDone(gameID);
+      if (game.status === 'night') await resolveNightIfDone(gameID);
+      else await resolveVoteIfDone(gameID, game.round, game.group_chat_id!);
     });
   }
 }
@@ -1039,6 +1224,7 @@ app.post('/webhook', async (req, res) => {
 
   const eventType = req.body.event_type;
   const event = req.body.data;
+  console.log(`webhook event_type=${eventType} raw=${JSON.stringify(req.body)}`);
   // Without this the bot reacts to the messages it sends itself.
   if (event?.direction !== 'inbound') return;
 
