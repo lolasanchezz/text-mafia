@@ -74,9 +74,15 @@ async function narrate(prompt: string, fallback: string, gameID?: number): Promi
     const messages: NarrationTurn[] = [...history, { role: 'user', content: prompt }];
     const message = await withTimeout(
       anthropic.messages.create({
-        model: 'claude-opus-5',
+        model: 'claude-haiku-4-5',
         max_tokens: 1024,
-        output_config: { effort: 'low' }, // short, latency-sensitive — depth isn't needed here
+        // No `thinking`: on Haiku that means none, which is what a one-line
+        // flavor message wants — thinking was most of the latency on opus.
+        // No `output_config.effort` either; Haiku 4.5 rejects it.
+        // The transcript only ever grows at the end, so the prefix is stable
+        // and cacheable — this stops us re-paying for the whole history on
+        // every beat as it fills up to 40 turns.
+        cache_control: { type: 'ephemeral' },
         system: NARRATOR_SYSTEM,
         messages,
       }),
@@ -200,7 +206,6 @@ async function reply(
   chatID: string,
   text: string,
   intendedFor = 'group',
-  effect?: { type: 'screen' | 'bubble'; name: string },
 ) {
   // DRY_RUN always wins, so the wiring can be checked without texting anyone.
   if (DRY_RUN) {
@@ -210,7 +215,7 @@ async function reply(
   // A real chat id is always used as-is: a real group chat stays real.
   if (isChatID(chatID)) {
     await linq.chats.messages.send(chatID, {
-      message: { parts: [{ type: 'text', value: text }], effect },
+      message: { parts: [{ type: 'text', value: text }] },
     });
     return;
   }
@@ -269,7 +274,6 @@ async function findGameInChat(chatID: string) {
 async function dm(
   user: { id: number; number: number; name?: string | null; dm_chat_id: string | null },
   text: string,
-  effect?: { type: 'screen' | 'bubble'; name: string },
 ) {
   const who = user.name ?? `+${user.number}`;
 
@@ -291,7 +295,7 @@ async function dm(
 
   if (user.dm_chat_id && isChatID(user.dm_chat_id)) {
     try {
-      await reply(user.dm_chat_id, text, who, effect);
+      await reply(user.dm_chat_id, text, who);
       return user.dm_chat_id;
     } catch (err) {
       // A stored chat can stop existing — a deleted thread, or one opened from
@@ -305,7 +309,7 @@ async function dm(
     const created = await linq.chats.create({
       from: process.env.PHONE_NUMBER!,
       to: [`+${user.number}`],
-      message: { parts: [{ type: 'text', value: text }], effect },
+      message: { parts: [{ type: 'text', value: text }] },
     });
     const { error } = await supabase
       .from('users')
@@ -472,7 +476,7 @@ async function assignRoles(gameID: number) {
     // The rules text is always the exact, tested ROLE_BLURB — only the one
     // sentence in front of it is up to the model, so this can never get long
     // or blur the actual mechanics.
-    await dm(player, ROLE_BLURB[role]!, { type: 'bubble', name: 'invisible' });
+    await dm(player, ROLE_BLURB[role]!);
   }
 
   return shuffled.map((p, i) => ({ ...p, role: roles[i]! }));
@@ -885,8 +889,6 @@ async function resolveVoteIfDone(gameID: number, round: number, chatID: string) 
         `${label(eliminated)} was ${role}.`,
         gameID,
       ),
-      'group',
-      { type: 'screen', name: 'spotlight' },
     );
   }
 
@@ -1283,7 +1285,14 @@ app.post('/webhook', async (req, res) => {
   }
 
   enqueue(key, async () => {
-    if (sender && sender.dm_chat_id === chatID) {
+    // A command is a command wherever it is typed. Without this, anything sent
+    // in a player's own dm chat went to handleNightReply and was read as a name
+    // — and with no open prompt that returns silently, so "end this game" in a
+    // dm did nothing at all.
+    const isCommand = [START_MESSAGE, JOIN_MESSAGE, BEGIN_MESSAGE, CANCEL_MESSAGE].some(
+      (c) => text === normalize(c),
+    );
+    if (sender && sender.dm_chat_id === chatID && !isCommand) {
       await handleNightReply(sender.id, part.value, chatID);
       return;
     }
