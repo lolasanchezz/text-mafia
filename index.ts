@@ -57,7 +57,7 @@ const NARRATOR_SYSTEM =
 
 type NarrationTurn = { role: 'user' | 'assistant'; content: string };
 
-// Flavor text for a moment in the game. Never used for anything a player
+// Flavor text for a moment in the game. Never used for anything player
 // needs to act on precisely — those stay plain text. Pass gameID to thread
 // this into the game's ongoing public story (dawn/vote/win beats only — never
 // pass gameID for anything containing secret info, like a role or a night
