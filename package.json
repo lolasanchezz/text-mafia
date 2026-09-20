@@ -14,11 +14,9 @@
     "@anthropic-ai/sdk": "^0.127.0",
     "@linqapp/sdk": "^0.69.2",
     "@supabase/supabase-js": "^2.116.0",
-    "express": "^5.2.1"
-  },
-  "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^26.6.2",
+    "express": "^5.2.1",
     "typescript": "^7.0.2"
   }
 }
